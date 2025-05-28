@@ -7,6 +7,8 @@ import os
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+
+
 def print_help():
     print("Usage:")
     print("  go2web -u <URL>         # make an HTTP request to the specified URL and print the response")
