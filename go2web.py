@@ -2,6 +2,8 @@ import socket
 import ssl
 import sys
 import re
+from bs4 import BeautifulSoup
+
 
 def print_help():
     print("""
@@ -53,24 +55,29 @@ def fetch_raw_http(host, path="/", redirect_count=0):
     return decoded
 
 
-def search_duckduckgo(query):
-    search_term = '+'.join(query)
+def search_term(term):
+    query = term.replace(" ", "+")
+    url = f"https://html.duckduckgo.com/html/?q={query}"
     host = "html.duckduckgo.com"
-    path = f"/html?q={search_term}"
+    path = f"/html/?q={query}"
 
+    print(f"🔍 Searching for: {term}")
     response = fetch_raw_http(host, path)
+    if response:
+        html = response.split("\r\n\r\n", 1)[1]
+        soup = BeautifulSoup(html, "html.parser")
+        results = soup.select(".result__title a")[:10]
 
-    # Extract top 10 search result titles and URLs
-    results = re.findall(r'<a rel="nofollow" class="result__a" href="(.*?)">(.*?)</a>', response)
-    
-    if not results:
-        print("No results found or parsing failed.")
-        return
-    
-    print(f"\n🔍 Top results for: {' '.join(query)}\n")
-    for i, (url, title) in enumerate(results[:10], start=1):
-        clean_title = re.sub('<.*?>', '', title)  # Strip HTML tags
-        print(f"{i}. {clean_title}\n   {url}\n")
+        if not results:
+            print("❌ No results found.")
+            return
+
+        print("\n🔗 Top 10 Search Results:")
+        for i, result in enumerate(results, 1):
+            title = result.get_text(strip=True)
+            link = result.get("href")
+            print(f"{i}. {title}\n   {link}\n")
+
 
 def fetch_url(url):
     if not url.startswith("http"):
