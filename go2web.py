@@ -11,10 +11,14 @@ Usage:
   go2web -h               # show this help
 """)
 
-def fetch_raw_http(host, path="/"):
+def fetch_raw_http(host, path="/", redirect_count=0):
+    if redirect_count > 3:
+        print("❌ Too many redirects")
+        return None
+
     port = 443
     request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: go2web-cli\r\n\r\n"
-    
+
     context = ssl.create_default_context()
     with socket.create_connection((host, port)) as sock:
         with context.wrap_socket(sock, server_hostname=host) as ssock:
@@ -25,7 +29,29 @@ def fetch_raw_http(host, path="/"):
                 if not chunk:
                     break
                 response += chunk
-    return response.decode(errors="ignore")
+
+    decoded = response.decode(errors="ignore")
+
+    # Check for redirect status codes
+    status_line = decoded.split("\r\n")[0]
+    headers = decoded.split("\r\n\r\n")[0]
+    status_code = int(status_line.split()[1])
+
+    if status_code in [301, 302]:
+        location_match = re.search(r"Location: (.+)", headers)
+        if location_match:
+            new_url = location_match.group(1).strip()
+            print(f"➡️ Redirecting to: {new_url}")
+
+            if new_url.startswith("http"):
+                new_url = new_url.replace("http://", "").replace("https://", "")
+            parts = new_url.split("/", 1)
+            new_host = parts[0]
+            new_path = "/" + parts[1] if len(parts) > 1 else "/"
+            return fetch_raw_http(new_host, new_path, redirect_count + 1)
+    
+    return decoded
+
 
 def search_duckduckgo(query):
     search_term = '+'.join(query)
@@ -56,12 +82,13 @@ def fetch_url(url):
         host = parts[0]
         path = "/" + parts[1] if len(parts) > 1 else "/"
         response = fetch_raw_http(host, path)
-        
-        # Extract body from response
-        body = response.split("\r\n\r\n", 1)[1]
-        print(body)
+
+        if response:
+            body = response.split("\r\n\r\n", 1)[1]
+            print(body)
     except Exception as e:
         print(f"❌ Error fetching URL: {e}")
+
 
 def main():
     if len(sys.argv) < 2:
