@@ -1,109 +1,227 @@
-import socket
+#!/usr/bin/env python3
 import sys
-import re
-import hashlib
+import argparse
+import socket
+from urllib.parse import urlparse, quote_plus
+import html2text
+import ssl
+from bs4 import BeautifulSoup
 import os
+import hashlib
+import pickle
+from pathlib import Path
+import webbrowser
 
-CACHE_DIR = "cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
+# Cache directory setup
+CACHE_DIR = Path.home() / '.go2web_cache'
+CACHE_DIR.mkdir(exist_ok=True)
 
+def get_cache_key(url: str) -> str:
+    """Generate a unique filename for each URL using MD5 hash."""
+    return hashlib.md5(url.encode()).hexdigest()
 
-
-def print_help():
-    print("Usage:")
-    print("  go2web -u <URL>         # make an HTTP request to the specified URL and print the response")
-    print("  go2web -s <search-term> # search using DuckDuckGo and print top 10 results")
-    print("  go2web -h               # show this help")
-
-def extract_text(html):
-    text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
-    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-def url_to_filename(url):
-    return hashlib.md5(url.encode()).hexdigest() + ".txt"
-
-def get_from_cache(url):
-    filename = os.path.join(CACHE_DIR, url_to_filename(url))
-    if os.path.exists(filename):
-        with open(filename, "r", encoding="utf-8") as f:
-            return f.read()
+def get_cached_response(url: str) -> str | None:
+    """Retrieve cached response if it exists."""
+    cache_key = get_cache_key(url)
+    cache_file = CACHE_DIR / cache_key
+    if cache_file.exists():
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
     return None
 
-def save_to_cache(url, content):
-    filename = os.path.join(CACHE_DIR, url_to_filename(url))
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(content)
+def cache_response(url: str, response: str) -> None:
+    """Save a response to the cache."""
+    cache_key = get_cache_key(url)
+    cache_file = CACHE_DIR / cache_key
+    with open(cache_file, 'wb') as f:
+        pickle.dump(response, f)
 
-def fetch_raw_http(url):
-    if not url.startswith("http://") and not url.startswith("https://"):
-        url = "http://" + url
+def http_request(url, accept='text/html', max_redirects=5):
+    """
+    Make an HTTP/HTTPS request with:
+    - Caching
+    - HTTPS support
+    - Redirect handling
+    - Content negotiation
+    """
+    if max_redirects <= 0:
+        return None, "Too many redirects"
 
-    cached = get_from_cache(url)
+    # Check cache first
+    cache_key = get_cache_key(url)
+    cached = get_cached_response(cache_key)
     if cached:
-        print("⚡ Loaded from cache")
-        return cached
+        return cached['content_type'], cached['body']
 
     try:
-        domain = url.split("//")[1].split("/")[0]
-        path = "/" + "/".join(url.split("//")[1].split("/")[1:])
+        parsed = urlparse(url)
+        if not parsed.scheme:
+            url = 'http://' + url
+            parsed = urlparse(url)
 
-        port = 80
-        request = f"GET {path} HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n"
+        host = parsed.netloc
+        path = parsed.path or '/'
+        if parsed.query:
+            path += '?' + parsed.query
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((domain, port))
-            s.sendall(request.encode())
-            response = b""
+        # Prepare headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': accept,
+            'Connection': 'close',
+            'Host': host
+        }
+
+        # Build request
+        request = f"GET {path} HTTP/1.1\r\n"
+        request += '\r\n'.join(f'{k}: {v}' for k, v in headers.items())
+        request += '\r\n\r\n'
+
+        # Create connection
+        context = ssl.create_default_context()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if parsed.scheme == 'https':
+                sock = context.wrap_socket(sock, server_hostname=host)
+            port = 443 if parsed.scheme == 'https' else 80
+            sock.connect((host, port))
+            sock.sendall(request.encode())
+
+            # Receive response
+            response = b''
             while True:
-                data = s.recv(4096)
+                data = sock.recv(4096)
                 if not data:
                     break
                 response += data
 
-        response_text = response.decode(errors="ignore")
-        body = response_text.split("\r\n\r\n", 1)[1]
+        # Parse response
+        headers_part, _, body = response.partition(b'\r\n\r\n')
+        headers = headers_part.decode('utf-8', errors='ignore')
 
-        save_to_cache(url, body)
-        return body
+        # Check for redirects (301, 302)
+        status_line = headers.split('\r\n')[0]
+        if '301' in status_line or '302' in status_line:
+            for line in headers.split('\r\n'):
+                if line.lower().startswith('location:'):
+                    new_url = line.split(':', 1)[1].strip()
+                    if not new_url.startswith('http'):
+                        new_url = f"{parsed.scheme}://{host}{new_url}"
+                    return http_request(new_url, accept, max_redirects-1)
+
+        # Get content type
+        content_type = 'text/html'  # default
+        for line in headers.split('\r\n'):
+            if line.lower().startswith('content-type:'):
+                content_type = line.split(':', 1)[1].strip()
+                break
+
+        decoded_body = body.decode('utf-8', errors='ignore')
+
+        # Cache the response (with content type)
+        cache_response(cache_key, {
+            'content_type': content_type,
+            'body': decoded_body
+        })
+
+        return content_type, decoded_body
+
     except Exception as e:
-        return f"Error fetching data: {e}"
+        print(f"Request failed: {str(e)}")
+        return None, None
+    
+def format_response(content_type, body):
+    """Convert response to human-readable format"""
+    if 'application/json' in content_type:
+        try:
+            import json
+            parsed = json.loads(body)
+            return json.dumps(parsed, indent=2)
+        except:
+            return body  # Fallback to raw if invalid JSON
+    else:
+        return make_human_readable(body)
 
-def handle_search(term):
-    query = term.replace(" ", "+")
-    search_url = f"http://html.duckduckgo.com/html/?q={query}"
-    html = fetch_raw_http(search_url)
+def make_human_readable(html):
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = True
+    return h.handle(html)
 
-    # Extract and print top 10 results
-    results = re.findall(r'<a rel="nofollow" class="result__a" href="(.*?)">(.*?)</a>', html)
-    for i, (link, title) in enumerate(results[:10]):
-        print(f"{i+1}. {extract_text(title)}")
-        print(f"   {link}\n")
+def search_bing(query):
+    try:
+        search_url = f"http://www.bing.com/search?q={quote_plus(query)}"
+        content_type, html = http_request(search_url)
+        if not html:
+            return []
+
+        soup = BeautifulSoup(html, 'html.parser')
+        results = []
+
+        # Find all result blocks in Bing
+        for result in soup.find_all('li', class_='b_algo'):
+            link = result.find('a')
+            if link:
+                title = link.get_text(strip=True)
+                href = link['href']
+                results.append({
+                    'title': title,
+                    'link': href
+                })
+                if len(results) >= 10:
+                    break
+
+        # Print results
+        print(f"Top {len(results)} results for '{query}':\n")
+        for i, result in enumerate(results, 1):
+            print(f"{i}. {result['title']}")
+            print(f"   {result['link']}\n")
+
+        # Prompt to open a link
+        try:
+            choice = int(input("Enter the result number to open (0 to skip): "))
+            if 1 <= choice <= len(results):
+                webbrowser.open(results[choice - 1]['link'])
+                print("Opening link in your default browser...")
+            elif choice == 0:
+                print("No link opened.")
+            else:
+                print("Invalid choice.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+        return results
+
+    except Exception as e:
+        print(f"Search error: {str(e)}")
+        return []
 
 def main():
-    if len(sys.argv) < 2:
-        print_help()
+    parser = argparse.ArgumentParser(description='go2web - HTTP client')
+    parser.add_argument('-u', '--url', help='URL to fetch')
+    parser.add_argument('-s', '--search', nargs='+', help='Search term')
+    parser.add_argument('--json', action='store_true', help='Prefer JSON response')
+    args = parser.parse_args()
+
+    if not any(vars(args).values()):
+        parser.print_help()
         return
 
-    option = sys.argv[1]
+    if args.url:
+        accept = 'application/json' if args.json else 'text/html'
+        content_type, response = http_request(args.url, accept)
+        if response:
+            print(format_response(content_type, response))
+    elif args.search:
+        search_term = ' '.join(args.search)
+        results = search_bing(search_term)
+        
+        if results:
+            print(f"Top {len(results)} results for '{search_term}':\n")
+            for i, result in enumerate(results, 1):
+                print(f"{i}. {result['title']}")
+                print(f"   {result['link']}\n")
+        else:
+            print("No results found. Please try a different search term.")
 
-    if option == "-h":
-        print_help()
-
-    elif option == "-u" and len(sys.argv) >= 3:
-        url = sys.argv[2]
-        html = fetch_raw_http(url)
-        print(extract_text(html))
-
-    elif option == "-s" and len(sys.argv) >= 3:
-        term = " ".join(sys.argv[2:])
-        handle_search(term)
-
-    else:
-        print("Invalid arguments.\n")
-        print_help()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
